@@ -1,0 +1,4 @@
+stage,implementation,avg_time_us
+range_fft,python,4580.4
+doppler_fft,python,6133.5
+ca_cfar_2d,python,230247.78
