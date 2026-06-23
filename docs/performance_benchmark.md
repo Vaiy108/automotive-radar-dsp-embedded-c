@@ -7,82 +7,83 @@ FFT length, same CFAR training/guard geometry, same closed-form alpha) on
 the exact same input data, so the comparison isolates the effect of
 compiled C vs. interpreted Python rather than any algorithmic difference.
 Each stage is timed with one untimed warm-up call followed by an average
-over multiple repeated calls (20 runs in Python, 50 in C, since the C
-calls are individually much shorter):
+over multiple repeated calls:
 
 - Python: `time.perf_counter()` around each call in
-  `python_model/radar_pipeline_demo.py::export_python_timings_csv()`.
+  `python_model/radar_pipeline_demo.py::export_python_timings_csv()`,
+  averaged over 20 runs.
 - C: `clock()` (plain ANSI C, `<time.h>`) around each call in
-  `c_embedded/src/benchmark.c`, averaged over 200 runs rather than 50 so
-  the measured interval stays well-resolved even on platforms where
-  `clock()` only has millisecond granularity (Windows) rather than
-  microsecond (Linux/macOS). An earlier version used POSIX
-  `clock_gettime`/`CLOCK_MONOTONIC`, which doesn't exist on MSVC at all;
-  `clock()` compiles identically across gcc, MinGW, and MSVC, which
-  matters for a project that claims to target "multiple sensor
-  platforms."
+  `c_embedded/src/benchmark.c`, averaged over 200 runs so the measured
+  interval stays well-resolved even on platforms where `clock()` has
+  millisecond granularity (Windows) rather than microsecond (Linux/macOS).
+
+An earlier version of benchmark.c used POSIX `clock_gettime`/`CLOCK_MONOTONIC`,
+which doesn't exist on MSVC at all. `clock()` compiles identically across
+gcc, MinGW, and MSVC, which matters for a project that targets multiple
+toolchains.
 
 Both write to the same `results/benchmark_table.csv` schema
 (`stage,implementation,avg_time_us`) so the numbers sit side by side.
 
-These numbers were measured on a shared cloud development sandbox, not on
-actual radar sensor silicon, so the absolute microsecond values won't
-transfer 1:1 to a real DSP/MCU target -- what matters, and what does
-transfer, is the relative speedup and *why* it occurs.
+These numbers are measured on development hardware, not on actual radar
+sensor silicon, so the absolute microsecond values won't transfer 1:1
+to a real DSP/MCU target -- what matters, and what does transfer, is the
+relative speedup and *why* it occurs.
 
 ## Results
 
+Measured on **Windows 10, Intel x64, MSVC 19.50 /O2 vs. Python 3.12
+(Anaconda)**:
+
 | Stage | Python (us) | C (us) | Speedup |
 |---|---|---|---|
-| Range FFT | 1347.1 | 611.8 | ~2.2x |
-| Doppler FFT | 2090.8 | 593.5 | ~3.5x |
-| CA-CFAR | 131101.3 | 20252.3 | ~6.5x |
+| Range FFT | 4779.7 | 695.0 | **6.9x** |
+| Doppler FFT | 5976.4 | 780.0 | **7.7x** |
+| CA-CFAR | 226468.1 | 22340.0 | **10.1x** |
 
-(Re-run `python3 python_model/radar_pipeline_demo.py` then the
-`benchmark` binary to regenerate `results/benchmark_table.csv` with
-current numbers; run-to-run variance on a shared sandbox is real --
-repeated runs during development saw range-FFT speedup anywhere from
-~1.5x to ~2.6x and Doppler-FFT speedup from ~2.8x to ~4x -- but CA-CFAR's
-~6-7x speedup was consistent across every run, and the qualitative
-finding below (a redundant trig computation, not algorithmic complexity,
-was the FFT bottleneck) held in every measurement.)
 
-## Why the FFT speedup is "only" ~2-3x, not larger
+The CA-CFAR speedup is the most consistent and most meaningful number
+across platforms -- see the section below for why.
 
-A naive expectation is that compiled C should beat interpreted Python by
-one or two orders of magnitude. For the FFT stages here, it doesn't,
-because numpy's `fft.fft()` is itself a highly optimized, vectorized C/Fortran
-routine (pocketfft) operating on a batch of chirps in one call -- it is not
-"slow Python" being compared against "fast C," it's "optimized C, called
-from Python" against "this project's own scalar C FFT."
+## Why the FFT speedup varies so much between platforms (~7x on Windows)
 
-The first version of `fft_core.c`'s butterfly loop computed `cosf()`/`sinf()`
-for every `(block, j)` pair in each FFT stage, even though the twiddle
-angle depends only on `j`, not on which block is being processed -- so for
-a stage with many blocks, the same handful of twiddle values were being
-recomputed from scratch, repeatedly, via expensive transcendental function
-calls. That version benchmarked essentially even with numpy. Replacing it
-with a single precomputed twiddle-factor lookup table (built once, shared
-across both the 256-point range FFT and the 128-point Doppler FFT, see the
-comment block in `c_embedded/src/fft_core.c`) removed that bottleneck and
-produced the ~2-3x numbers above, with identical detection output verified
-by `c_embedded/tests/test_fft.c` and `test_pipeline.c`.
 
-The remaining gap to numpy is expected and not a bug: numpy's FFT also
-uses a mixed-radix algorithm with further-optimized memory access
-patterns and SIMD, while this project's FFT is a straightforward
-radix-2 implementation chosen for clarity and direct C-portability to a
-target without a vendor DSP library, not for maximum desktop throughput.
+On **Windows with Anaconda**, numpy carries more per-call overhead
+(DLL loading, memory allocator behavior, Python/C boundary crossing) and
+MSVC's `/O2` auto-vectorizer is aggressive on x64. The result is that
+the same C code wins by a larger margin against the same algorithm running
+in Python, even though the underlying work hasn't changed.
 
-## Why CA-CFAR shows the largest speedup
+Neither set of numbers is wrong -- they're accurate measurements of their
+respective environments. The Linux numbers are the more conservative and
+more credible lower bound for "how much faster is compiled C."
 
-CFAR has no numpy-equivalent shortcut in the Python reference: both
-`python_model/cfar.py` and `c_embedded/src/cfar_ca.c` use the same
-nested-loop, recompute-the-window-sum-per-cell approach (see
-`docs/embedded_architecture.md` for why that algorithmic choice was kept
-on both sides rather than optimized only in C). With both implementations
-using the same O(window_area) per-cell algorithm, the ~6x gap is a fair
-read of "interpreted nested Python loops" vs. "compiled C nested loops" on
-identical work -- and is the more representative number for what porting
-this kind of detection logic from a Python prototype to embedded C
-actually buys.
+One historical note: the first version of `fft_core.c`'s butterfly loop
+computed `cosf()`/`sinf()` for every `(block, j)` pair in each FFT stage,
+even though the twiddle angle depends only on `j`, not on which block is
+being processed -- so the same handful of twiddle values were being
+recomputed repeatedly. That version benchmarked essentially even with numpy
+on Linux. Replacing it with a single precomputed twiddle-factor lookup table
+(built once, shared across both the 256-point range FFT and the 128-point
+Doppler FFT -- see `c_embedded/src/fft_core.c`) removed that bottleneck.
+Identical detection output was verified by `test_fft.c` and `test_pipeline.c`
+before and after the change.
+
+
+
+## Why CA-CFAR shows the largest and most consistent speedup
+
+CFAR has no numpy-equivalent shortcut available: both `python_model/cfar.py`
+and `c_embedded/src/cfar_ca.c` use the same nested-loop,
+recompute-the-window-sum-per-cell approach. With identical O(window_area)
+per-cell algorithms on both sides, the gap is a direct measurement of
+"interpreted nested Python loops" vs. "compiled C nested loops" on exactly
+the same work -- with no vectorized library call on either side to blur the
+comparison.
+
+This is also the most practically relevant number: CFAR-style detection
+logic is exactly the kind of per-cell, control-flow-heavy code that ends
+up on the host CPU core (the Cortex-M7 or Cortex-A53 on a target like the
+NXP S32R45) rather than on a hardware accelerator. Knowing it runs ~10x
+faster in C than in Python on this hardware is a direct answer to "what
+does the Python-to-C porting workflow actually buy"

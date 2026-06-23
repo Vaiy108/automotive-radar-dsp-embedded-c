@@ -38,7 +38,7 @@ detections happen to occur" is not a valid array size. The first version
 of this buffer was sized to a round number (32) that looked generous for a
 two-target test scene.
 
-It wasn't. CA-CFAR doesn't produce one hit per target; it produces a hit
+Actually, CA-CFAR doesn't produce one hit per target; it produces a hit
 for every cell whose power clears the local threshold, which on a real
 target's mainlobe-plus-sidelobe footprint is often several dozen cells
 spread across both targets combined. With the buffer capped at 32, the
